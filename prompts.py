@@ -9,27 +9,16 @@ unless you also intend to change GEPA behavior.
 # They do NOT add new information, new examples, new constraints, or new types.
 
 INITIAL_TRANSFORMATION_RULES = """
-
 1. Rename vague variables in the prose to descriptive ones (s→sequence, n→count, x→value).
    Do NOT change the function or class name in the starter code.
 
-2. Replace domain-specific nouns with generic algorithmic equivalents:
-   boxes→containers, graph→network, coins→items, grid→2D matrix.
-
-3. Soften precise algorithmic language so the model picks its own correct strategy
-   instead of a broken memorized template:
-   "minimum cost path"→"cheapest route",
-   "bipartite"→"split into two groups".
-
-4. Restate how the input arrives if the original is ambiguous about parsing:
+2. Restate how the input arrives if the original is ambiguous about parsing:
    "Input is a Python list, already parsed. Iterate with indices starting at 0."
    Only rephrase what's already implied — do not invent new format details.
 
-5. Rewrite vague constraints already in the problem as explicit boundaries:
+3. Rewrite vague constraints already in the problem as explicit boundaries:
    "divisors"→"integers strictly smaller than x that divide x evenly".
    Rewrite negatives as positives: "not greater than"→"less than or equal to".
-
-
 """
 
 # ── Prompt for applying rules to a single problem ─────────────────────────────
@@ -42,9 +31,11 @@ TRANSFORMATION RULES:
 ORIGINAL PROMPT:
 {original_prompt}
 
-Apply only the relevant transformation rules above (at least more than one rule MUST be applied ) to improve the original prompt.
-CRITICAL: Do NOT add new examples, new constraints, new test cases, or any information
-not already present in the original.
+You MUST apply at least 1 rule if applicable. For each rule you apply, ask yourself: does this change make the problem CLEARER?
+- If renaming a variable or term would make it LESS precise in context → apply it only if the new name is strictly more descriptive.
+- If softening algorithmic language would cause ambiguity → apply it carefully, preserving the core meaning.
+Apply each rule independently. Rules that would actively confuse the reader should be skipped for this problem. If no rule is applicable without harming clarity, return the prompt unchanged.
+CRITICAL: Do NOT add new examples, new constraints, new test cases, or any information not already present in the original.
 Output ONLY the improved prompt. No explanation, no preamble."""
 
 # ── Prompt for mutating the rules themselves ──────────────────────────────────
@@ -63,13 +54,34 @@ For each failure you will see:
 - IMPROVED PROMPT: what the rules transformed it into
 - CODE GENERATED: what the model wrote from the improved prompt
 - ERROR: why it failed
+- REFERENCE SOLUTION: the correct solution, shown ONLY to help you reason about
+  WHY the generated code is wrong. This is privileged information.
 
 {failures}
 
-Your task:
-1. Compare ORIGINAL and IMPROVED PROMPT to see what the rules did.
-2. Identify whether the transformation was harmful, insufficient, or unrelated to the failure.
-3. Improve the rules to fix these specific failure patterns.
+ABSOLUTE PROHIBITIONS — VIOLATING ANY OF THESE INVALIDATES YOUR OUTPUT:
+- NEVER reproduce, paraphrase, or hint at the REFERENCE SOLUTION in your rules.
+- NEVER mention specific algorithms, data structures, function names, variable names,
+  or code fragments from the reference solutions.
+- NEVER include code blocks, def, class, return, for, while, or if statements in your rules.
+- NEVER name specific problem types, domains, or keywords from the failures.
+- Rules MUST be GENERAL transformations applicable to ANY problem, not hints about
+  these specific problems.
+- The reference solution is for YOUR INTERNAL REASONING ONLY. Use it to judge whether
+  a rule made the prompt misleading. Then produce general rules without any leakage.
+
+Your task — reason step by step for EACH failure (silently, do not output the reasoning):
+1. Compare ORIGINAL PROMPT vs IMPROVED PROMPT word by word. Identify exactly what changed
+   (renamed terms, softened language, replaced nouns, etc.) and which rule NUMBER caused it.
+2. Compare CODE GENERATED to the REFERENCE SOLUTION. Where did the generated code diverge
+   from correctness? Did a rule cause that divergence by making a precise term vague?
+   - If YES → that rule is HARMFUL. Remove it or restrict its scope.
+   - If the prompt barely changed → the rule was irrelevant; the failure has another cause.
+   - If a rename made a precise term vague → harmful.
+3. A rule that causes confusion or wrong code across multiple failures MUST be REMOVED or
+   its wording tightened so it only applies when it genuinely helps.
+4. Only add a new rule if it would fix a pattern visible in multiple failures, expressed
+   as a GENERAL transformation.
 
 CRITICAL CONSTRAINTS (non-negotiable):
 - Rules MUST apply to ANY problem, not just the failed ones shown.
@@ -82,4 +94,5 @@ Guidelines:
 - Improve or remove rules that seem harmful.
 - Rules must only reframe/clarify, never add new information, types, or solution steps.
 
-Output ONLY the improved transformation rules. No explanation."""
+Output ONLY the improved transformation rules as numbered items. No explanation, no code,
+no references to specific problems, no mention of the reference solutions."""

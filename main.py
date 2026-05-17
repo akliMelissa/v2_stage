@@ -14,10 +14,16 @@ To tune the GEPA loop:    edit NUM_PROBLEMS / GENERATIONS / MINIBATCH_SIZE / VAL
 """
 
 import json
+from datetime import datetime
 
-from config import NUM_PROBLEMS, RESULTS_DIR
+from config import (
+    NUM_PROBLEMS, RESULTS_DIR, MODEL_NAME,
+    GENERATIONS, MINIBATCH_SIZE, VAL_SIZE, EVAL_TIMEOUT,
+    LCB_DATASET, LCB_VERSION_TAG, GEN_TEMPERATURE, MAX_NEW_TOKENS,
+)
 from data_loader import load_livecodebench
 from evaluator import evaluate_baseline, evaluate_one
+from prompts import INITIAL_TRANSFORMATION_RULES
 from gepa import run_gepa
 
 
@@ -127,6 +133,70 @@ def main():
 
     print(f"\nResults saved to {RESULTS_DIR}/results.json")
     print(f"Generation log saved to {RESULTS_DIR}/gen_log.json")
+
+    # ── Analysis report ───────────────────────────────────────────────────────
+    stable_pass = [x for x in per_problem if x["status"] == "stable_pass"]
+    stable_fail = [x for x in per_problem if x["status"] == "stable_fail"]
+
+    report_lines = [
+        f"# GEPA Analysis Report",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "## Model & Benchmark",
+        f"- **LLM**: `{MODEL_NAME}`",
+        f"- **Benchmark**: {LCB_DATASET} / `{LCB_VERSION_TAG}`",
+        f"- **Problems evaluated**: {len(problems)}",
+        "",
+        "## Configuration",
+        f"- Generations: {GENERATIONS}",
+        f"- Minibatch size: {MINIBATCH_SIZE}",
+        f"- Val size: {VAL_SIZE}",
+        f"- Eval timeout: {EVAL_TIMEOUT}s",
+        f"- Gen temperature: {GEN_TEMPERATURE}",
+        f"- Max new tokens: {MAX_NEW_TOKENS}",
+        "",
+        "## Results",
+        f"| | Passed | % |",
+        f"|---|---|---|",
+        f"| Baseline | {baseline_score}/{len(problems)} | {baseline_score/len(problems)*100:.1f}% |",
+        f"| GEPA     | {gepa_score}/{len(problems)} | {gepa_score/len(problems)*100:.1f}% |",
+        f"| **Delta** | **{delta:+d}** | **{delta/len(problems)*100:+.1f}%** |",
+        "",
+        f"| Status | Count |",
+        f"|---|---|",
+        f"| Improved (+) | {len(improved)} |",
+        f"| Regressed (-) | {len(regressed)} |",
+        f"| Stable pass | {len(stable_pass)} |",
+        f"| Stable fail | {len(stable_fail)} |",
+        "",
+        "## Initial Transformation Rules",
+        "```",
+        INITIAL_TRANSFORMATION_RULES.strip(),
+        "```",
+        "",
+        "## Best Transformation Rules (after GEPA)",
+        "```",
+        best_rules.strip(),
+        "```",
+        "",
+        f"## Improved Problems (+{len(improved)})",
+    ]
+    for x in improved:
+        report_lines.append(f"- `{x['task_id']}`")
+
+    report_lines += [
+        "",
+        f"## Regressed Problems (-{len(regressed)})",
+    ]
+    for x in regressed:
+        report_lines.append(
+            f"- `{x['task_id']}` — baseline error: `{x['baseline_error'] or 'OK'}` "
+            f"→ gepa error: `{x['gepa_error']}`"
+        )
+
+    report_path = RESULTS_DIR / "analysis.md"
+    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+    print(f"Analysis report saved to {report_path}")
 
 
 if __name__ == "__main__":

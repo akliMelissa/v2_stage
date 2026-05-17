@@ -14,21 +14,21 @@ import torch
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
-CUDA_DEVICE = int(os.environ.get("CUDA_DEVICE", "0"))
+CUDA_DEVICE = int(os.environ.get("CUDA_DEVICE", "2"))
 DEVICE = f"cuda:{CUDA_DEVICE}" if torch.cuda.is_available() else "cpu"
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
-MAX_NEW_TOKENS = 1500
+MAX_NEW_TOKENS = 2048
 GEN_TEMPERATURE = 0.1
 
 # ── GEPA loop ─────────────────────────────────────────────────────────────────
 
-NUM_PROBLEMS   = 30
-GENERATIONS    = 5
-MINIBATCH_SIZE = 10
-VAL_SIZE       = 15
-EVAL_TIMEOUT   = 30
+NUM_PROBLEMS   = 511
+GENERATIONS    = 10
+MINIBATCH_SIZE = 30
+VAL_SIZE       = 30
+EVAL_TIMEOUT   = 60
 
 # ── Benchmark ─────────────────────────────────────────────────────────────────
 
@@ -38,5 +38,5 @@ LCB_FALLBACK_REPO  = "bzantium/livecodebench"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-RESULTS_DIR = Path("results_gepa_lcb_v3")
-CACHE_DIR   = Path(".gepa_cache_lcb_v3")
+RESULTS_DIR = Path("results_gepa_lcb_v5")
+CACHE_DIR   = Path(".gepa_cache_lcb_v5")

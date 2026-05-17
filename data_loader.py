@@ -3,7 +3,8 @@ data_loader.py — Load LiveCodeBench problems from HuggingFace.
 
 Returns a list of dicts with the fields the rest of the pipeline expects:
     task_id, question_content, original_prompt, starter_code,
-    public_test_cases, private_test_cases, difficulty, platform
+    public_test_cases, private_test_cases, difficulty, platform,
+    canonical_solution
 
 LCB ships test cases as base64-encoded zlib-compressed JSON in some
 releases and as plain JSON strings in others. We pass them through
@@ -49,6 +50,12 @@ def load_livecodebench(n: int = NUM_PROBLEMS) -> list[dict]:
 def _normalize_row(row: dict, i: int) -> dict:
     """Shape an LCB dataset row into the dict the rest of the pipeline expects."""
     content = row.get("question_content", "") or ""
+    canonical = (
+        row.get("canonical_solution", "")
+        or row.get("solution", "")
+        or row.get("code", "")
+        or ""
+    )
     return {
         "task_id":            str(row.get("question_id", f"lcb_{i}")),
         "question_content":   content,
@@ -58,6 +65,7 @@ def _normalize_row(row: dict, i: int) -> dict:
         "private_test_cases": row.get("private_test_cases", "[]"),
         "difficulty":         row.get("difficulty", "unknown"),
         "platform":           row.get("platform", "unknown"),
+        "canonical_solution": canonical,
     }
 
 

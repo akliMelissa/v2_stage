@@ -21,7 +21,7 @@ import re
 from config import GEN_TEMPERATURE, MAX_NEW_TOKENS
 from cache import cache_get, cache_set, BASELINE_KEY
 from code_extraction import extract_code
-from model import safe_call
+from model import safe_call, CODE_GEN_SYSTEM_PROMPT
 from prompts import APPLY_RULES_PROMPT
 from test_runner import run_tests
 
@@ -77,6 +77,15 @@ def apply_transformation_rules(rules: str, original_prompt: str) -> str:
 
 # ── Code generation ────────────────────────────────────────────────────────
 
+_CODE_GEN_SUFFIX = (
+    "\n\nWrite a complete, fully implemented Python solution. "
+    "Do NOT use `pass`, empty function bodies, or placeholder docstrings — every function must contain real logic. "
+    "Always include ALL necessary imports at the top (e.g. from functools import lru_cache, "
+    "from collections import defaultdict, import heapq, etc.). "
+    "Wrap your solution in a ```python ... ``` code block."
+)
+
+
 def generate_code(prompt: str, starter_code: str = "",
                   temperature: float = GEN_TEMPERATURE) -> str:
     """Generate code from a prompt, attaching starter code when present."""
@@ -84,12 +93,15 @@ def generate_code(prompt: str, starter_code: str = "",
         full_prompt = (
             f"{prompt}\n\n"
             f"Complete this starter code:\n```python\n{starter_code}\n```"
+            f"{_CODE_GEN_SUFFIX}"
         )
     else:
-        full_prompt = prompt
-    
+        full_prompt = prompt + _CODE_GEN_SUFFIX
+
     return extract_code(
-        safe_call(full_prompt, temperature=temperature, max_new_tokens=MAX_NEW_TOKENS)
+        safe_call(full_prompt, temperature=temperature,
+                  max_new_tokens=MAX_NEW_TOKENS,
+                  system_prompt=CODE_GEN_SYSTEM_PROMPT)
     )
 
 
@@ -108,16 +120,17 @@ def _make_result(p: dict, original: str, improved: str, code: str,
     with `success` and `error` for GEPA loop compatibility.
     """
     return {
-        "success":       pass_at_1,
-        "error":         "" if pass_at_1 else status,
-        "Pass@1":        pass_at_1,
-        "Tests_Passed":  tests_passed,
-        "n_Tests":       n_tests,
-        "Eval_Status":   status,
-        "prompt":        original,
-        "improved":      improved,
-        "code":          code,
-        "task_id":       p["task_id"],
+        "success":            pass_at_1,
+        "error":              "" if pass_at_1 else status,
+        "Pass@1":             pass_at_1,
+        "Tests_Passed":       tests_passed,
+        "n_Tests":            n_tests,
+        "Eval_Status":        status,
+        "prompt":             original,
+        "improved":           improved,
+        "code":               code,
+        "task_id":            p["task_id"],
+        "canonical_solution": p.get("canonical_solution", ""),
     }
 
 
@@ -128,6 +141,9 @@ def evaluate_one(p: dict, rules: str) -> dict:
     """
     cached = cache_get(p["task_id"], rules)
     if cached is not None and isinstance(cached, dict) and "success" in cached:
+        # Backfill canonical_solution for older cached entries
+        if "canonical_solution" not in cached:
+            cached["canonical_solution"] = p.get("canonical_solution", "")
         return cached
 
     original = _build_full_prompt(p)
@@ -154,6 +170,8 @@ def evaluate_baseline(p: dict) -> dict:
     """Evaluate one problem with the original prompt — no transformation. Cached."""
     cached = cache_get(p["task_id"], BASELINE_KEY)
     if cached is not None and isinstance(cached, dict) and "success" in cached:
+        if "canonical_solution" not in cached:
+            cached["canonical_solution"] = p.get("canonical_solution", "")
         return cached
 
     original = _build_full_prompt(p)

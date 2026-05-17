@@ -71,6 +71,10 @@ HEADER = (
     "from typing import *\n"
     "from collections import *\n"
     "from math import *\n"
+    "from functools import *\n"
+    "from itertools import *\n"
+    "from heapq import *\n"
+    "from bisect import *\n"
 )
 
 
@@ -132,26 +136,26 @@ def _normalize(x):
     return x
 
 def check(candidate):
-    \"\"\"Test harness: candidate is the actual function/method to call.
-    
-    Note: We don't care about the function's name. We just call it.
-    \"\"\"
     _TESTS = {tests_json}
     passed = 0
     total  = {total}
-    for _tc in _TESTS:
+    first_fail = None
+    for _i, _tc in enumerate(_TESTS):
         _inp_raw = _tc.get('input', '')
         _exp_raw = _tc.get('output', '')
-        # Parse input arguments (newline-separated)
         _args = [_safe_parse(_line) for _line in str(_inp_raw).strip().split(chr(10)) if _line.strip()]
         _exp = _safe_parse(_exp_raw)
         try:
             _got = candidate(*_args)
-        except Exception:
+        except Exception as _e:
+            if first_fail is None:
+                first_fail = f"test {{_i+1}} raised {{type(_e).__name__}}: {{_e}}"
             continue
         if _normalize(_got) == _normalize(_exp):
             passed += 1
-    return passed, total
+        elif first_fail is None:
+            first_fail = f"test {{_i+1}}: got {{repr(_got)}}, expected {{repr(_exp)}}"
+    return passed, total, first_fail
 """
     return body, total
 
@@ -173,14 +177,13 @@ def _build_stdin_check(tests: List[Dict[str, str]]) -> Tuple[str, int]:
     body = f"""
 import sys, io
 def check(candidate):
-    \"\"\"Test harness: candidate is the raw source code (string).\"\"\"
     _TESTS = {tests_json}
     passed = 0
     total  = {total}
-    for _tc in _TESTS:
+    first_fail = None
+    for _i, _tc in enumerate(_TESTS):
         _inp = _tc.get('input', '')
         _exp = _tc.get('output', '').strip()
-        # Patch stdin
         sys.stdin = io.StringIO(_inp)
         _out_buf = io.StringIO()
         _old_stdout = sys.stdout
@@ -189,14 +192,18 @@ def check(candidate):
             exec(candidate, {{'__name__': '__main__'}})
         except SystemExit:
             pass
-        except Exception:
+        except Exception as _e:
             sys.stdout = _old_stdout
+            if first_fail is None:
+                first_fail = f"test {{_i+1}} raised {{type(_e).__name__}}: {{_e}}"
             continue
         sys.stdout = _old_stdout
         _got = _out_buf.getvalue().strip()
         if _got == _exp:
             passed += 1
-    return passed, total
+        elif first_fail is None:
+            first_fail = f"test {{_i+1}}: got {{repr(_got)}}, expected {{repr(_exp)}}"
+    return passed, total, first_fail
 """
     return body, total
 
@@ -235,45 +242,66 @@ def _safe_exec(
     """
     try:
         env: Dict[str, Any] = {}
-        exec(candidate_code, env)
-        
+
+        if not stdin_mode:
+            exec(HEADER + "\n" + candidate_code, env)
+
         if not stdin_mode:
             # Functional mode: find the callable by name
             if entry_point:
                 fn = env.get(entry_point)
                 if not callable(fn):
-                    # Try case-insensitive match
+                    # Try case-insensitive match at top level
                     for k, v in env.items():
                         if k.lower() == entry_point.lower() and callable(v):
                             fn = v
                             break
                 if not callable(fn):
-                    queue.put((0, f"Function `{entry_point}` not found"))
+                    # Try as a method inside any class (e.g. class Solution)
+                    for v in env.values():
+                        if isinstance(v, type):
+                            method = getattr(v, entry_point, None)
+                            if callable(method):
+                                try:
+                                    fn = getattr(v(), entry_point)
+                                    break
+                                except Exception:
+                                    continue
+                if not callable(fn):
+                    queue.put((0, f"Function `{entry_point}` not found", None))
                     return
                 fns = [fn]
             else:
                 # No entry point: try ALL callables
                 fns = [v for v in env.values() if callable(v)]
-            
+
             if not fns:
-                queue.put((0, "Function not found"))
+                queue.put((0, "Function not found", None))
                 return
         else:
             # Stdin mode: candidate_code is the source string
             # We'll pass it directly to check() as a string
             fns = [candidate_code]
         
-        def run(fn) -> int:
+        best_score = 0
+        best_fail = None
+
+        def run(fn):
             env["candidate"] = fn
             exec(check_code + "\n_result = check(candidate)", env)
-            passed, _ = env["_result"]
-            return passed
-        
-        best_score = max(run(f) for f in fns)
-        queue.put((best_score, "OK"))
+            passed, _, fail = env["_result"]
+            return passed, fail
+
+        for f in fns:
+            score, fail = run(f)
+            if score > best_score:
+                best_score = score
+                best_fail = fail
+
+        queue.put((best_score, "OK", best_fail))
     
     except Exception as exc:
-        queue.put((0, f"ERROR: {type(exc).__name__}: {exc}"))
+        queue.put((0, f"ERROR: {type(exc).__name__}: {exc}", None))
 
 
 def evaluate_with_timeout(
@@ -283,13 +311,12 @@ def evaluate_with_timeout(
     timeout_seconds: int = 20,
     entry_point: Optional[str] = None,
     stdin_mode: bool = False,
-) -> Tuple[int, str]:
+) -> Tuple[int, str, Optional[str]]:
     """Run code + check in a subprocess with a wall-clock timeout.
-    
-    Spawns a Process, waits up to timeout_seconds, kills if needed.
-    Returns (tests_passed, status_message).
-    
-    Status message is "OK" on success, "ERROR: ..." on failure.
+
+    Returns (tests_passed, status_message, first_failure_reason).
+    status_message is "OK" on clean run, "ERROR: ..." on crash/timeout.
+    first_failure_reason is the first wrong-answer or exception detail, or None.
     """
     queue: mp.Queue = mp.Queue()
     proc = mp.Process(
@@ -298,16 +325,16 @@ def evaluate_with_timeout(
     )
     proc.start()
     proc.join(timeout=timeout_seconds)
-    
+
     if proc.is_alive():
         proc.terminate()
         proc.join()
-        return 0, "ERROR: Timeout/Killed"
-    
+        return 0, "ERROR: Timeout/Killed", None
+
     try:
         return queue.get_nowait()
     except Exception:
-        return 0, "ERROR: Unknown"
+        return 0, "ERROR: Unknown", None
 
 
 # ── Public entry point ─────────────────────────────────────────────────────
@@ -336,24 +363,25 @@ def run_tests(code: str, problem: dict) -> Tuple[bool, str, int, int]:
     is_functional = bool(starter_code.strip())
 
     if is_functional:
-        # Functional mode: extract the expected function name from starter code
         m = re.search(r"def\s+(\w+)\s*\(", starter_code)
         entry_point = m.group(1) if m else None
-        
         check_code, n_tests = _build_functional_check(tests)
-        
-        # Try with the entry point hint. If it fails, _safe_exec will report it.
-        passed, status = evaluate_with_timeout(
+        passed, status, first_fail = evaluate_with_timeout(
             code, check_code, timeout_seconds=EVAL_TIMEOUT,
             entry_point=entry_point, stdin_mode=False
         )
     else:
-        # Stdin mode: code is raw source, not a function
         check_code, n_tests = _build_stdin_check(tests)
-        passed, status = evaluate_with_timeout(
+        passed, status, first_fail = evaluate_with_timeout(
             code, check_code, timeout_seconds=EVAL_TIMEOUT,
             entry_point=None, stdin_mode=True
         )
 
     pass_at_1 = (passed == n_tests) and (status == "OK")
+    if not pass_at_1:
+        if status == "OK":
+            status = f"{passed}/{n_tests} tests passed"
+            if first_fail:
+                status += f" — {first_fail}"
+        # for ERROR/timeout statuses, keep them as-is
     return pass_at_1, status, passed, n_tests
