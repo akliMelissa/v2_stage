@@ -1,98 +1,79 @@
 """
 prompts.py — Initial transformation rules and prompt templates.
-
-These are kept VERBATIM from the original script. Do not change wording
-unless you also intend to change GEPA behavior.
 """
 
 # ── Initial transformation rules ──────────────────────────────────────────────
 # They do NOT add new information, new examples, new constraints, or new types.
-
 INITIAL_TRANSFORMATION_RULES = """
-1. Rename vague variables in the prose to descriptive ones (s→sequence, n→count, x→value).
-   Do NOT change the function or class name in the starter code.
 
-2. Restate how the input arrives if the original is ambiguous about parsing:
-   "Input is a Python list, already parsed. Iterate with indices starting at 0."
-   Only rephrase what's already implied — do not invent new format details.
+1. Clarify vague variables in the prose by adding descriptive definitions, but NEVER change the variable name itself (e.g., instead of changing "s" to "sequence", change it to "the string s (representing the sequence)"). The actual variable names (n, k, s, etc.) must remain exactly the same throughout the text.
 
-3. Rewrite vague constraints already in the problem as explicit boundaries:
-   "divisors"→"integers strictly smaller than x that divide x evenly".
-   Rewrite negatives as positives: "not greater than"→"less than or equal to".
+2. Clarify input and output formats without altering structure or casing:
+   - Clarify what each line contains and what the separator is, but NEVER alter the sequence, the total number of lines, or the token generation expectations of the original problem.
+   - CRITICAL: Maintain exact casing, formatting, and spelling for literal string outputs (e.g., if the problem expects "Yes", "No", "First", or "Second", do not modify them to "YES", "NO", "true", or alter their printing format).
+   - CRITICAL: When clarifying, do not introduce code-specific phrasing (e.g., do not mention "indices", "sliding windows", "iterations", or "arrays" unless they were in the original text) to avoid steering the model toward wrong algorithmic templates.
+
+3. Rewrite constraint bounds to avoid symbols, but ALWAYS retain the exact mathematical limits explicitly:
+   Instead of: "1 ≤ n ≤ 10^5"
+   Rephrase to: "The value of n is at least 1 and at most 10^5"
+   
+   Instead of: "M is prime"
+   Rephrase to: "M is a prime number"
+   
+   Instead of: "graph diameter"
+   Rephrase to: "the maximum distance between any two nodes (the graph diameter)"
+   
+   CRITICAL: Never omit, abstract, or smooth over strict mathematical boundaries. Do not use ambiguous phrases like 'a large practical limit' or 'special property'. State the precise mathematical boundaries and edge-case values exactly as given.
+
+4. Clarify ambiguous conditions by explicitly stating both branches (e.g., what to do if a condition is met, and what to do if it is not).
+
 """
 
 # ── Prompt for applying rules to a single problem ─────────────────────────────
+APPLY_RULES_PROMPT = """You are a precise competitive programming text editor. Your ONLY job is to improve the prose of a problem description using specific transformation rules.
 
-APPLY_RULES_PROMPT = """You are a prompt engineering expert at improving competitive programming prompts.
-
-TRANSFORMATION RULES:
+[TRANSFORMATION RULES]
 {rules}
 
-ORIGINAL PROMPT:
+[INPUT PROBLEM]
+Read the original prompt below carefully. You must maintain every single sample test case, number, and example intact.
+<original_prompt>
 {original_prompt}
+</original_prompt>
 
-You MUST apply at least 1 rule if applicable. For each rule you apply, ask yourself: does this change make the problem CLEARER?
-- If renaming a variable or term would make it LESS precise in context → apply it only if the new name is strictly more descriptive.
-- If softening algorithmic language would cause ambiguity → apply it carefully, preserving the core meaning.
-Apply each rule independently. Rules that would actively confuse the reader should be skipped for this problem. If no rule is applicable without harming clarity, return the prompt unchanged.
-CRITICAL: Do NOT add new examples, new constraints, new test cases, or any information not already present in the original.
-Output ONLY the improved prompt. No explanation, no preamble."""
+[CRITICAL INSTRUCTIONS]
+1. Apply the transformation rules ONLY to the narrative/prose parts.
+2. DO NOT modify, delete, or leave empty the "Sample Input", "Sample Output", or any example sections. Copy them EXACTLY as they are.
+3. DO NOT append your own task description, instructions, or the words "Your Task" to the output.
+4. Stop generating immediately after copying the final notes of the problem.
+4. 5. CRITICAL ANTI-OVERENGINEERING GUARDRAIL: When refining problem text, preserve the narrative sequence of operations as an ongoing process. Do not introduce structural vocabulary (like "segments", "intervals", "windows", "combinations", or "matrices") that subtly encourages the code generator to substitute plain, step-by-step state simulation with rigid, index-based math formulas.
+
+[OUTPUT FORMAT]
+Respond ONLY with the text of the improved competitive programming prompt. Do not include markdown code fences (```) around your whole response. No preamble, no meta-commentary.
+
+IMPROVED PROMPT START:"""
+
+
 
 # ── Prompt for mutating the rules themselves ──────────────────────────────────
-
 MUTATE_RULES_PROMPT = """You are optimizing transformation rules for competitive programming prompts.
 
-CURRENT TRANSFORMATION RULES:
+CURRENT RULES:
 {current_rules}
 
-These rules were applied to {batch_size} coding problems.
-Results: {passed}/{batch_size} generated correct code after transformation.
+Results: {passed}/{batch_size} problems passed.
 
-FAILED PROBLEMS:
-For each failure you will see:
-- ORIGINAL PROMPT: the original problem before transformation
-- IMPROVED PROMPT: what the rules transformed it into
-- CODE GENERATED: what the model wrote from the improved prompt
-- ERROR: why it failed
-- REFERENCE SOLUTION: the correct solution, shown ONLY to help you reason about
-  WHY the generated code is wrong. This is privileged information.
-
+FAILURES (what changed, what went wrong):
 {failures}
 
-ABSOLUTE PROHIBITIONS — VIOLATING ANY OF THESE INVALIDATES YOUR OUTPUT:
-- NEVER reproduce, paraphrase, or hint at the REFERENCE SOLUTION in your rules.
-- NEVER mention specific algorithms, data structures, function names, variable names,
-  or code fragments from the reference solutions.
-- NEVER include code blocks, def, class, return, for, while, or if statements in your rules.
-- NEVER name specific problem types, domains, or keywords from the failures.
-- Rules MUST be GENERAL transformations applicable to ANY problem, not hints about
-  these specific problems.
-- The reference solution is for YOUR INTERNAL REASONING ONLY. Use it to judge whether
-  a rule made the prompt misleading. Then produce general rules without any leakage.
+Task:
+1. For each failure, identify which rule caused the problem.
+2. If a rule causes multiple failures, REMOVE it. Only soften it if removal is not possible.
+3. Add a new rule ONLY if it fixes multiple failures without harming others.
+4. Rules must clarify existing information, never add new information.
 
-Your task — reason step by step for EACH failure (silently, do not output the reasoning):
-1. Compare ORIGINAL PROMPT vs IMPROVED PROMPT word by word. Identify exactly what changed
-   (renamed terms, softened language, replaced nouns, etc.) and which rule NUMBER caused it.
-2. Compare CODE GENERATED to the REFERENCE SOLUTION. Where did the generated code diverge
-   from correctness? Did a rule cause that divergence by making a precise term vague?
-   - If YES → that rule is HARMFUL. Remove it or restrict its scope.
-   - If the prompt barely changed → the rule was irrelevant; the failure has another cause.
-   - If a rename made a precise term vague → harmful.
-3. A rule that causes confusion or wrong code across multiple failures MUST be REMOVED or
-   its wording tightened so it only applies when it genuinely helps.
-4. Only add a new rule if it would fix a pattern visible in multiple failures, expressed
-   as a GENERAL transformation.
+PROHIBITIONS:
+- Do NOT mention algorithm names, data structures, or problem types.
+- Do NOT add information that requires user validation.
 
-CRITICAL CONSTRAINTS (non-negotiable):
-- Rules MUST apply to ANY problem, not just the failed ones shown.
-- Do NOT mention specific problem types, keywords, or domains from the failures above.
-- Do NOT add "specify the type of", "provide examples", or "list the steps" — these add new info.
-- Do NOT suggest breaking problems into sub-steps or mentioning algorithms by name.
-
-Guidelines:
-- Add a new rule only if it's a general transformation that would help multiple problem types.
-- Improve or remove rules that seem harmful.
-- Rules must only reframe/clarify, never add new information, types, or solution steps.
-
-Output ONLY the improved transformation rules as numbered items. No explanation, no code,
-no references to specific problems, no mention of the reference solutions."""
+Output ONLY the improved rules as numbered items. No explanation. No preamble. No meta-commentary."""

@@ -19,20 +19,19 @@ from datetime import datetime
 from config import (
     NUM_PROBLEMS, RESULTS_DIR, MODEL_NAME,
     GENERATIONS, MINIBATCH_SIZE, VAL_SIZE, EVAL_TIMEOUT,
-    LCB_DATASET, LCB_VERSION_TAG, GEN_TEMPERATURE, MAX_NEW_TOKENS,
+    LCB_DATASET, LCB_VERSION_TAG, GEN_TEMPERATURE,
 )
 from data_loader import load_livecodebench
-from evaluator import evaluate_baseline, evaluate_one
+from evaluator import evaluate_baseline_batch, evaluate_batch
+from model import safe_call
 from prompts import INITIAL_TRANSFORMATION_RULES
 from gepa import run_gepa
 
 
 def final_eval(rules: str, problems: list) -> list[dict]:
     """Evaluate final rules on every problem. Returns list of result dicts."""
-    results = []
-    for i, p in enumerate(problems, 1):
-        r = evaluate_one(p, rules)
-        results.append(r)
+    results = evaluate_batch(problems, rules)
+    for i, r in enumerate(results, 1):
         status = "PASS" if r["success"] else f"FAIL ({r['error']})"
         print(f"  [final] {i}/{len(problems)} — {status}", flush=True)
     return results
@@ -48,10 +47,8 @@ def main():
     # ── Baseline ──────────────────────────────────────────────────────────────
     print(f"\nComputing baseline on {len(problems)} problems (cached after first run)...")
     
-    baseline_details = []
-    for i, p in enumerate(problems, 1):
-        r = evaluate_baseline(p)
-        baseline_details.append(r)
+    baseline_details = evaluate_baseline_batch(problems)
+    for i, r in enumerate(baseline_details, 1):
         status = "PASS" if r["success"] else f"FAIL ({(r['error'] or '')[:60]})"
         print(f"  [baseline] {i}/{len(problems)} — {status}", flush=True)
     baseline_score = sum(r["success"] for r in baseline_details)
@@ -61,7 +58,16 @@ def main():
     )
 
     # ── GEPA ──────────────────────────────────────────────────────────────────
-    best_rules, gen_log = run_gepa(problems)
+    best_rules, gen_log = run_gepa(
+        problems,
+        initial_rules=INITIAL_TRANSFORMATION_RULES,
+        evaluate_fn=lambda rules, examples: evaluate_batch(examples, rules),
+        llm_reflect_fn=safe_call,
+        llm_merge_fn=safe_call,
+        generations=GENERATIONS,
+        minibatch_size=MINIBATCH_SIZE,
+        val_size=VAL_SIZE,
+    )
 
     # ── Final evaluation ──────────────────────────────────────────────────────
     print("\nRunning final evaluation with best transformation rules...")
@@ -131,8 +137,47 @@ def main():
     with open(RESULTS_DIR / "gen_log.json", "w") as f:
         json.dump(gen_log, f, indent=2)
 
+    # ── Detailed trace.json ───────────────────────────────────────────────────
+    trace = {
+        "initial_rules": INITIAL_TRANSFORMATION_RULES,
+        "best_rules": best_rules,
+        "per_problem": [
+            {
+                "task_id":           g["task_id"],
+                "original_prompt":   b["prompt"],
+                "improved_prompt":   g.get("improved", ""),
+                "canonical_solution": g.get("canonical_solution", ""),
+                "baseline_pass":     b["success"],
+                "gepa_pass":         g["success"],
+                "baseline_error":    b["error"],
+                "gepa_error":        g["error"],
+            }
+            for b, g in zip(baseline_details, gepa_details)
+        ],
+        "gen_log": gen_log,
+    }
+    with open(RESULTS_DIR / "trace.json", "w") as f:
+        json.dump(trace, f, indent=2)
+
+    # ── Per-problem console summary ───────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print("PER-PROBLEM DETAILED TRACE")
+    print(f"{'='*80}")
+    for b, g in zip(baseline_details, gepa_details):
+        tid = g["task_id"]
+        b_ok = "PASS ✓" if b["success"] else f"FAIL ✗  ({(b['error'] or '')[:60]})"
+        g_ok = "PASS ✓" if g["success"] else f"FAIL ✗  ({(g['error'] or '')[:60]})"
+        print(f"\n── {tid} ──")
+        print(f"  Baseline : {b_ok}")
+        print(f"  GEPA     : {g_ok}")
+        print(f"  ORIGINAL PROMPT:\n    {b['prompt'][:600].replace(chr(10), chr(10)+'    ')}")
+        print(f"  IMPROVED PROMPT:\n    {g.get('improved','')[:600].replace(chr(10), chr(10)+'    ')}")
+        if g.get("canonical_solution"):
+            print(f"  CANONICAL:\n    {g['canonical_solution'][:300].replace(chr(10), chr(10)+'    ')}")
+
     print(f"\nResults saved to {RESULTS_DIR}/results.json")
     print(f"Generation log saved to {RESULTS_DIR}/gen_log.json")
+    print(f"Detailed trace saved to {RESULTS_DIR}/trace.json")
 
     # ── Analysis report ───────────────────────────────────────────────────────
     stable_pass = [x for x in per_problem if x["status"] == "stable_pass"]
@@ -153,7 +198,6 @@ def main():
         f"- Val size: {VAL_SIZE}",
         f"- Eval timeout: {EVAL_TIMEOUT}s",
         f"- Gen temperature: {GEN_TEMPERATURE}",
-        f"- Max new tokens: {MAX_NEW_TOKENS}",
         "",
         "## Results",
         f"| | Passed | % |",
