@@ -5,10 +5,6 @@ Returns a list of dicts with the fields the rest of the pipeline expects:
     task_id, question_content, original_prompt, starter_code,
     public_test_cases, private_test_cases, difficulty, platform,
     canonical_solution
-
-LCB ships test cases as base64-encoded zlib-compressed JSON in some
-releases and as plain JSON strings in others. We pass them through
-unchanged here — decoding happens in test_runner.py where it's needed.
 """
 
 from datasets import load_dataset

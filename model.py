@@ -8,6 +8,7 @@ import os
 import time
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer

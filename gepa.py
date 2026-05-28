@@ -23,28 +23,22 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from config import (
+    GENERATIONS, POPULATION_SIZE, PARETO_SIZE, MINIBATCH_SIZE, VAL_SIZE,
+    NUM_PROBLEMS, MUTATION_RATE, PERFECT_SCORE,
+    MAX_MERGE_INVOCATIONS, MERGE_VAL_OVERLAP_FLOOR,
+)
+from prompts import MUTATE_RULES_PROMPT
+
 
 def _diff_rules(old: str, new: str) -> str:
+    # compare les deux versions de règles ligne par ligne et retourne les différences
     diff = list(difflib.unified_diff(
         old.splitlines(keepends=True),
         new.splitlines(keepends=True),
         fromfile="before", tofile="after", lineterm="",
     ))
     return "".join(diff) if diff else "(no change)"
-
-# ── Configuration (injectée depuis l'extérieur ou valeurs par défaut) ────────
-
-DEFAULT_GENERATIONS = 10
-DEFAULT_POPULATION_SIZE = 4
-DEFAULT_PARETO_SIZE = 6
-DEFAULT_MINIBATCH_SIZE = 8
-DEFAULT_VAL_SIZE = 20
-DEFAULT_DEV_VAL_SPLIT = 0.5
-DEFAULT_MUTATION_RATE = 0.7
-DEFAULT_PERFECT_SCORE = 1.0
-DEFAULT_MAX_MERGE_INVOCATIONS = 5
-DEFAULT_MERGE_VAL_OVERLAP_FLOOR = 2
-
 
 # ── Data structures ──────────────────────────────────────────────────────────
 
@@ -59,51 +53,6 @@ class RuleCandidate:
     evaluated_val_ids: set[int] = field(default_factory=set)
     parents: list[int] = field(default_factory=list)
     id: int = 0
-
-
-# ── Prompts de reflection (fidèles au papier) ────────────────────────────────
-
-REFLECTION_PROMPT_TEMPLATE = """
-I provided an assistant with the following transformation rules to improve code-generation prompts:
-
-```
-{rules}
-```
-
-The following are examples of different original prompts provided to the assistant, 
-along with the assistant's transformed prompt, the generated code, and the evaluation result.
-For each example, you will see:
-- The original user prompt
-- The transformed prompt produced by the rules
-- The code generated from the transformed prompt
-- The agent trajectory (if available) showing reasoning, tool calls, and intermediate steps
-- Feedback on how the result could be better
-
-{inputs_outputs_feedback}
-
-Your task is to write a NEW set of transformation rules for the assistant.
-
-Read the inputs carefully and identify the input format and infer a detailed task description.
-Carefully examine the agent trajectories to understand HOW the assistant is approaching the task. Look at:
-- What reasoning steps the assistant takes
-- Where the assistant makes mistakes or suboptimal choices
-- What information the assistant is missing or misinterpreting
-
-Read all the assistant responses and the corresponding feedback. 
-Identify all niche and domain-specific factual information about the task and include it in the rules.
-The assistant may have utilized a generalizable strategy; if so, include that in the rules as well.
-
-Based on the feedback AND the agent trajectories, identify what the assistant is doing wrong 
-or could do better, and incorporate specific guidance to address these issues in the new rules.
-
-Important constraints:
-- Keep the same structure: numbered rules 1., 2., 3., etc.
-- Do not add code examples, function signatures, or algorithm names inside the rules
-- Focus on improving clarity, specificity, and actionable guidance for prompt transformation
-- The rules must describe HOW to transform a bad prompt into a good one, not solve the coding task itself
-
-Provide the new rules as a numbered list.
-""".strip()
 
 
 MERGE_PROMPT_TEMPLATE = """
@@ -157,69 +106,87 @@ def _join_rules(rule_list: list[str]) -> str:
 
 
 def _sanitize_rules(rules: str, fallback: str) -> str:
-    """Nettoie et valide que la sortie est bien une liste de règles numérotées."""
-    if not rules or len(rules) < 50:
+    # nettoie la sortie du llm pour ne garder que la liste numérotée
+
+    # si le llm a produit quelque chose de trop court ou vide, on garde les règles précédentes
+    if not rules or len(rules) < 30:
         return fallback
-    # Vérifie qu'il y a au moins une ligne numérotée
-    if not re.search(r'^\s*\d+\.', rules, re.MULTILINE):
+
+    # on cherche le "1." qui marque le début de la liste — tout ce qui précède est du blabla llm
+    m = re.search(r'(?m)^\s*1\.\s', rules)
+    if not m:
+        return fallback
+    # on coupe tout ce qui est avant le premier "1."
+    rules = rules[m.start():]
+    # on retire le gras markdown (**texte** → texte)
+    rules = re.sub(r'\*\*([^*]+)\*\*', r'\1', rules)
+    # on retire les titres markdown (## Section → Section)
+    rules = re.sub(r'(?m)^#+\s+', '', rules)
+    rules = rules.strip()
+    # dernier contrôle : si après nettoyage c'est encore trop court, fallback
+    if len(rules) < 30:
         return fallback
     return rules
 
 
-# ── Formatage du feedback pour reflection (succès + échecs) ──────────────────
+def _format_reflect_sections(
+    results: list[dict],
+    baseline_by_id: dict[str, bool],
+) -> tuple[str, str, str]:
+    # trie les résultats en 3 groupes pour donner du contexte au mutateur de règles
+    helped, regressed, still_failing = [], [], []
 
-def _format_feedback_for_reflection(
-    examples: list[dict[str, str]],
-    results: list[dict[str, Any]],
-    scores: list[dict[str, float]],
-    perfect_score: float = 1.0,
-    valid_placeholders: set[str] | None = None,
-) -> str:
-    """Formate TOUS les exemples (succès et échecs) avec feedback pour le mutateur.
+    for r in results:
+        tid = r.get("task_id", "")
+        cur = r.get("success", False)
+        # baseline_by_id contient le résultat sans transformation pour chaque problème
+        base = baseline_by_id.get(tid)
+        if base is None:
+            # si on n'a pas de baseline pour ce problème, on ne peut pas classer → on ignore
+            pass
+        elif not base and cur:
+            # baseline échoue, règles réussissent → les règles ont aidé
+            helped.append(r)
+        elif base and not cur:
+            # baseline réussit, règles échouent → les règles ont cassé quelque chose
+            regressed.append(r)
+        elif not base and not cur:
+            # les deux échouent → les règles n'ont pas encore résolu ce problème
+            still_failing.append(r)
+        # base=True et cur=True → stable_pass → aucun signal utile, on saute
 
-    Contrairement à l'ancien _format_failures qui ne montrait que les échecs,
-    ici on montre aussi les succès pour que le mutateur sache ce qu'il ne faut PAS casser.
-    """
-    formatted_parts = []
-    for i, (example, result, score) in enumerate(zip(examples, results, scores)):
-        # Score moyen
-        avg_score = sum(score.values()) / len(score) if score else 0.0
-
-        if avg_score >= perfect_score:
-            score_str = f"Perfect success. Scores: {score}."
-            feedback = "These rules worked well here. Preserve this behavior."
-        elif avg_score >= perfect_score * 0.5:
-            score_str = f"Partial success. Scores: {score}."
-            feedback = "Consider how to improve the weaker aspects while keeping what works."
-        else:
-            score_str = f"Needs improvement. Scores: {score}."
-            feedback = "The transformation did not produce a good enough prompt for this task."
-
-        # Extrait les champs pertinents
-        original_prompt = example.get("prompt", "N/A")
-        transformed_prompt = result.get("improved", "N/A")
-        code = result.get("code", "N/A")[:800]
-        error = result.get("error", "")
-        trajectory = result.get("trajectory", "")
-
-        traj_str = ""
-        if trajectory:
-            traj_str = (
-                f"\n\n**Agent Trajectory (reasoning & steps):**\n"
-                f"```\n{str(trajectory)[:600]}\n```"
+    def _fmt_pass(items: list[dict]) -> str:
+        # formate les cas qui sont passés de fail → pass (exemples positifs pour le mutateur)
+        if not items:
+            return "(none)"
+        parts = []
+        for r in items[:3]: # juste quelque exmples positifs 
+            parts.append(
+                f"Problem {r.get('task_id', '?')} (rules applied: {r.get('applied_rules', '?')}):\n"
+                f"  Original : {r.get('prompt', '')}\n"
+                f"  Improved : {r.get('improved', '')}\n"
+                f"  Result   : PASSED"
             )
+        return "\n\n".join(parts)
 
-        formatted_parts.append(
-            f"### Example {i + 1} ###\n"
-            f"**Original Prompt:**\n```\n{original_prompt}\n```\n\n"
-            f"**Transformed Prompt:**\n```\n{transformed_prompt}\n```\n\n"
-            f"**Generated Code:**\n```\n{code}\n```\n"
-            f"{traj_str}\n\n"
-            f"**Feedback:** {score_str} {feedback}"
-            + (f"\n**Error:** {error}" if error else "")
-        )
+    def _fmt_fail(items: list[dict]) -> str:
+        # formate les cas qui échouent avec le code généré, la solution correcte et l'erreur
+        # la solution canonique permet au mutateur de voir ce que le prompt aurait dû produire
+        if not items:
+            return "(none)"
+        parts = []
+        for r in items:
+            parts.append(
+                f"Problem {r.get('task_id', '?')} (rules applied: {r.get('applied_rules', '?')}):\n"
+                f"  Original          : {r.get('prompt', '')}\n"
+                f"  Improved          : {r.get('improved', '')}\n"
+                f"  Generated code    : {(r.get('code') or '')}\n"
+                f"  Canonical solution: {(r.get('canonical_solution') or '(not available)')}\n"
+                f"  Error             : {r.get('error', '')}"
+            )
+        return "\n\n".join(parts)
 
-    return "\n\n---\n\n".join(formatted_parts)
+    return _fmt_pass(helped), _fmt_fail(regressed), _fmt_fail(still_failing)
 
 
 # ── GEPA Core ────────────────────────────────────────────────────────────────
@@ -233,16 +200,16 @@ class GEPA:
         evaluate_fn: Callable[[str, list[dict]], list[dict]],
         llm_reflect_fn: Callable[[str], str],
         llm_merge_fn: Callable[[str], str] | None = None,
-        max_generations: int = DEFAULT_GENERATIONS,
-        population_size: int = DEFAULT_POPULATION_SIZE,
-        pareto_size: int = DEFAULT_PARETO_SIZE,
-        mutation_rate: float = DEFAULT_MUTATION_RATE,
-        dev_val_split: float = DEFAULT_DEV_VAL_SPLIT,
-        perfect_score: float = DEFAULT_PERFECT_SCORE,
+        max_generations: int = GENERATIONS,
+        population_size: int = POPULATION_SIZE,
+        pareto_size: int = PARETO_SIZE,
+        mutation_rate: float = MUTATION_RATE,
+        dev_val_split: float = (NUM_PROBLEMS - VAL_SIZE) / max(1, NUM_PROBLEMS),
+        perfect_score: float = PERFECT_SCORE,
         use_merge: bool = True,
-        max_merge_invocations: int = DEFAULT_MAX_MERGE_INVOCATIONS,
-        merge_val_overlap_floor: int = DEFAULT_MERGE_VAL_OVERLAP_FLOOR,
-        minibatch_size: int = DEFAULT_MINIBATCH_SIZE,
+        max_merge_invocations: int = MAX_MERGE_INVOCATIONS,
+        merge_val_overlap_floor: int = MERGE_VAL_OVERLAP_FLOOR,
+        minibatch_size: int = MINIBATCH_SIZE,
     ):
         """
         Args:
@@ -268,19 +235,31 @@ class GEPA:
         self.merge_val_overlap_floor = merge_val_overlap_floor
         self.minibatch_size = minibatch_size
 
-        # État
+        # --- état interne ---
+        # liste des candidats actifs dans la génération courante
         self.candidates: list[RuleCandidate] = []
+        # ensemble des meilleurs candidats par instance de validation (front de pareto)
         self.pareto_frontier: list[RuleCandidate] = []
+        # pour chaque index de problème val, quel candidat y est le meilleur
         self.best_per_val_instance: dict[int, RuleCandidate] = {}
+        # problèmes utilisés pour la mutation/reflection (jamais vus par le pareto)
         self.dev_examples: list[dict[str, str]] = []
+        # problèmes utilisés pour la sélection pareto (jamais vus par le mutateur)
         self.val_examples: list[dict[str, str]] = []
+        # résultat baseline par task_id : True si le modèle réussissait sans transformation
+        self.baseline_by_id: dict[str, bool] = {}
+        # compteur pour donner un id unique à chaque candidat créé
         self._candidate_id = 0
+        # nombre de merges déjà effectués (limité par max_merge_invocations)
         self._merge_invocations = 0
+        # paires de candidats déjà mergées pour éviter de refaire le même merge
         self._attempted_merges: set[tuple[int, int]] = set()
+        # historique des règles de chaque candidat (pour le merge 3-way)
         self._historical_rules: dict[int, str] = {}
+        # arbre généalogique : qui sont les parents de chaque candidat
         self._ancestry: dict[int, list[int]] = {}
 
-        # Initialiser avec le candidat seed
+        # on démarre avec un seul candidat : les règles initiales
         self.candidates.append(self._new_candidate(initial_rules))
 
     def _new_candidate(self, rules: str, parents: list[int] | None = None) -> RuleCandidate:
@@ -310,7 +289,8 @@ class GEPA:
         return bool(scores) and all(v >= self.perfect_score for v in scores.values())
 
     def _should_accept(self, parent_scores: dict[str, float], child_scores: dict[str, float]) -> bool:
-        """Gating GEPA : accepte si l'enfant n'est pas pire que le parent (>=)."""
+        # gate gepa : le candidat enfant est accepté seulement s'il fait au moins aussi bien que le parent
+        # (>= et pas strictement > : une égalité suffit à accepter)
         if not parent_scores or not child_scores:
             return True
         return sum(child_scores.values()) >= sum(parent_scores.values())
@@ -332,21 +312,13 @@ class GEPA:
         results = self.evaluate_fn(rules, examples)
 
         for i, (example, result) in enumerate(zip(examples, results)):
+            # score binaire uniquement : 1.0 si le code passe tous les tests, 0.0 sinon
+            # on n'utilise PAS Tests_Passed/n_Tests pour éviter de biaiser le pareto
+            # (un problème avec 4/5 tests ne doit pas battre un problème avec 0/2 tests)
             success = result.get("success", False)
-            scores = {"success": 1.0 if success else 0.0}
-            for k, v in result.items():
-                if k != "success" and isinstance(v, (int, float)):
-                    scores[k] = float(v)
-            all_scores.append(scores)
+            all_scores.append({"success": 1.0 if success else 0.0})
             if capture_results:
                 full_results.append(result)
-                status = "PASS ✓" if success else f"FAIL ✗  ({(result.get('error') or '')[:80]})"
-                tid = result.get("task_id", f"#{i}")
-                print(f"\n    [{tid}] {status}")
-                orig = result.get("prompt", "")
-                imp  = result.get("improved", "")
-                print(f"    ORIGINAL : {orig[:400].replace(chr(10), chr(10)+'             ')}")
-                print(f"    IMPROVED : {imp[:400].replace(chr(10), chr(10)+'             ')}")
 
         return self._aggregate_scores(all_scores), all_scores, full_results
 
@@ -362,23 +334,34 @@ class GEPA:
     def _reflect(
         self,
         rules: str,
-        examples: list[dict[str, str]],
         results: list[dict[str, Any]],
-        scores: list[dict[str, float]],
     ) -> str:
-        """Génère un nouvel ensemble de règles via réflexion LLM."""
-        feedback = _format_feedback_for_reflection(
-            examples, results, scores, self.perfect_score
-        )
+        # mutation des règles par le llm : on lui montre ce qui a aidé, ce qui a régressé, ce qui échoue encore
+        # le llm lit les exemples et propose une version améliorée des règles
 
-        prompt = REFLECTION_PROMPT_TEMPLATE.format(
-            rules=rules,
-            inputs_outputs_feedback=feedback,
+        # on trie les résultats en 3 catégories avec le contexte baseline
+        helped, regressed, still_failing = _format_reflect_sections(
+            results, self.baseline_by_id
+        )
+        passed = sum(1 for r in results if r.get("success"))
+
+        # on construit le prompt de mutation avec toutes les catégories
+        prompt = MUTATE_RULES_PROMPT.format(
+            current_rules=rules,
+            passed=passed,
+            total=len(results),
+            pass_improvements=helped,
+            pass_regressions=regressed,
+            fail_failures=still_failing,
         )
         new_rules = self.llm_reflect_fn(prompt)
+        # on nettoie la sortie llm (retire le blabla avant le "1.", le markdown, etc.)
         new_rules = _sanitize_rules(new_rules, fallback=rules)
+        # on affiche le diff pour voir ce que le llm a changé
         print(f"\n  [REFLECT] Rule diff:\n{_diff_rules(rules, new_rules)}\n")
         return new_rules
+
+        
 
     def _compute_val_overlap(
         self, c1: RuleCandidate, c2: RuleCandidate
@@ -472,6 +455,8 @@ class GEPA:
             )
             merged_rules = self.llm_merge_fn(prompt)
             merged_rules = _sanitize_rules(merged_rules, fallback=ancestor_rules)
+            if merged_rules in (ancestor_rules, c1.rules, c2.rules):
+                return None
         else:
             # Fallback heuristique : 3-way textuel simple
             p1, p2 = c1.rules, c2.rules
@@ -518,10 +503,12 @@ class GEPA:
         return self._merge_structural(c1, c2)
 
     def _update_pareto(self, candidate: RuleCandidate) -> None:
-        """Met à jour le front de Pareto instance-level."""
+        # met à jour le front de pareto instance par instance
+        # chaque candidat "gagne" les instances de validation où il est le meilleur
         prev_frontier_ids = {c.id for c in self.pareto_frontier}
 
         candidate.val_instance_wins = set()
+        # on note quels indices val ce candidat a été évalué sur
         candidate.evaluated_val_ids = set(range(len(candidate.per_item_val_scores)))
 
         for idx, scores in enumerate(candidate.per_item_val_scores):
@@ -529,21 +516,26 @@ class GEPA:
             current_best = self.best_per_val_instance.get(idx)
 
             if current_best is None:
+                # premier candidat à être évalué sur cette instance → il gagne par défaut
                 self.best_per_val_instance[idx] = candidate
                 candidate.val_instance_wins.add(idx)
             else:
                 best_score = sum(current_best.per_item_val_scores[idx].values())
                 if score > best_score:
+                    # ce candidat bat le précédent meilleur → on transfère la victoire
                     current_best.val_instance_wins.discard(idx)
                     self.best_per_val_instance[idx] = candidate
                     candidate.val_instance_wins.add(idx)
                 elif score == best_score:
+                    # égalité : les deux gagnent cette instance
                     candidate.val_instance_wins.add(idx)
 
+        # on reconstruit le front : tous les candidats qui ont au moins une victoire
         frontier_candidates = {c.id: c for c in self.best_per_val_instance.values()}
         if candidate.val_instance_wins:
             frontier_candidates[candidate.id] = candidate
 
+        # on trie par nombre de victoires et on garde les meilleurs (pareto_size max)
         new_frontier = sorted(
             frontier_candidates.values(),
             key=lambda c: len(c.val_instance_wins),
@@ -564,7 +556,7 @@ class GEPA:
         Returns:
             Le meilleur RuleCandidate trouvé.
         """
-        # Split dev/val
+        # on mélange les problèmes et on les coupe en deux : dev pour muter, val pour le pareto
         shuffled = train_examples.copy()
         random.shuffle(shuffled)
         split = max(1, int(len(shuffled) * self.dev_val_split))
@@ -576,7 +568,8 @@ class GEPA:
         print("=" * 80)
 
         for gen in range(self.max_generations):
-            # ── Évaluation de la population actuelle ─────────────────────────
+            # on garde les données de reflection de chaque candidat pour les réutiliser
+            # sans refaire un appel gpu si le même candidat est choisi comme parent
             candidate_reflection_data: dict[
                 int,
                 tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, float]]]
@@ -585,7 +578,7 @@ class GEPA:
             for idx, candidate in enumerate(self.candidates):
                 print(f"\n  Gen {gen+1}/{self.max_generations} | DEV eval | candidate {candidate.id}")
 
-                # Dev : capture résultats pour reflection
+                # évaluation sur un sous-ensemble du dev (minibatch) pour capturer les résultats de mutation
                 dev_batch = (
                     self.dev_examples
                     if len(self.dev_examples) <= self.minibatch_size
@@ -594,9 +587,10 @@ class GEPA:
                 candidate.dev_scores, dev_item_scores, dev_results = self._run_minibatch(
                     candidate.rules, dev_batch, capture_results=True
                 )
+                # on sauvegarde les données de dev pour éviter de refaire l'éval si ce candidat est choisi parent
                 candidate_reflection_data[candidate.id] = (dev_batch, dev_results, dev_item_scores)
 
-                # Val : sélection Pareto
+                # évaluation sur tout le val pour mettre à jour le front de pareto
                 print(f"  Gen {gen+1}/{self.max_generations} | VAL eval | candidate {candidate.id}")
                 candidate.val_scores, candidate.per_item_val_scores, _ = self._run_minibatch(
                     candidate.rules, self.val_examples
@@ -610,16 +604,17 @@ class GEPA:
                     f"wins={len(candidate.val_instance_wins)}"
                 )
 
-            # ── Génération suivante (sauf dernière) ──────────────────────────
+            # on ne génère pas de nouvelle population après la dernière génération
             if gen < self.max_generations - 1:
                 new_candidates: list[RuleCandidate] = []
 
-                # Phase 1 : Mutations réflexives
+                # phase 1 : on génère population_size nouveaux candidats par mutation réflexive
                 while len(new_candidates) < self.population_size:
                     if random.random() < self.mutation_rate and self.pareto_frontier:
+                        # on choisit un parent dans le front de pareto, pondéré par ses victoires
                         parent = self._weighted_choice(self.pareto_frontier)
 
-                        # Early stop si parfait
+                        # si le parent a un score parfait sur dev, pas la peine de muter
                         if self._is_perfect(parent.dev_scores):
                             new_candidates.append(parent)
                             print(f"  Gen {gen+1} | REFLECT | candidate {parent.id} is perfect, copying")
@@ -627,11 +622,12 @@ class GEPA:
 
                         print(f"  Gen {gen+1} | REFLECT | mutating candidate {parent.id}")
 
-                        # Récupère les données de reflection
+                        # on réutilise les données de dev déjà calculées si disponibles
                         if parent.id in candidate_reflection_data:
                             dev_batch, dev_results, dev_item_scores = candidate_reflection_data[parent.id]
                             parent_scores = parent.dev_scores
                         else:
+                            # sinon on refait l'éval (ça ne devrait pas arriver souvent)
                             dev_batch = (
                                 self.dev_examples
                                 if len(self.dev_examples) <= self.minibatch_size
@@ -641,12 +637,11 @@ class GEPA:
                                 parent.rules, dev_batch, capture_results=True
                             )
 
-                        new_rules = self._reflect(
-                            parent.rules, dev_batch, dev_results, dev_item_scores
-                        )
+                        # le llm lit les résultats et propose une version améliorée des règles
+                        new_rules = self._reflect(parent.rules, dev_results)
                         child = self._new_candidate(new_rules, parents=[parent.id])
 
-                        # Gating : évalue l'enfant sur le même dev batch
+                        # gate : on évalue l'enfant sur le même batch pour vérifier qu'il n'est pas pire
                         print(f"  Gen {gen+1} | GATE | testing child {child.id}")
                         child.dev_scores, _, _ = self._run_minibatch(child.rules, dev_batch)
 
@@ -657,15 +652,17 @@ class GEPA:
                                 f"({sum(child.dev_scores.values()):.2f} >= {sum(parent_scores.values()):.2f})"
                             )
                         else:
+                            # l'enfant est pire → on l'abandonne (le parent reste dans le pareto)
                             print(
                                 f"  Gen {gen+1} | GATE | REJECT child {child.id} "
                                 f"({sum(child.dev_scores.values()):.2f} < {sum(parent_scores.values()):.2f})"
                             )
                     elif self.candidates:
-                        # Copie un candidat existant si pas de mutation
+                        # pas de mutation cette fois : on copie un candidat existant
                         new_candidates.append(random.choice(self.candidates))
 
-                # Phase 2 : Merge structurel depuis le front de Pareto
+                # phase 2 : on essaie de merger deux candidats du front de pareto
+                # l'idée est de combiner les règles qui marchent sur des instances différentes
                 if self.use_merge and len(self.pareto_frontier) >= 2:
                     print(f"  Gen {gen+1} | MERGE | attempting structural merge")
                     merged = self._try_merge_from_frontier()
@@ -732,10 +729,11 @@ def run_gepa_fidele(
     evaluate_fn: Callable[[str, list[dict]], list[dict]],
     llm_reflect_fn: Callable[[str], str],
     llm_merge_fn: Callable[[str], str] | None = None,
-    generations: int = DEFAULT_GENERATIONS,
-    population_size: int = DEFAULT_POPULATION_SIZE,
-    minibatch_size: int = DEFAULT_MINIBATCH_SIZE,
+    generations: int = GENERATIONS,
+    population_size: int = POPULATION_SIZE,
+    minibatch_size: int = MINIBATCH_SIZE,
     val_size: int | None = None,
+    baseline_results: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     """Wrapper simplifié compatible avec ton ancienne interface `run_gepa`.
 
@@ -747,23 +745,22 @@ def run_gepa_fidele(
         llm_merge_fn: Optionnel, pour le merge LLM-guided
         generations, population_size, minibatch_size: Hyperparamètres
         val_size: Si fourni, force la taille du val set (sinon utilise dev_val_split)
+        baseline_results: Optionnel. Résultats baseline (sans transformation) avec task_id et
+            success. Permet au mutateur de distinguer Pass→Fail (régressions) de Fail→Fail.
 
     Returns:
         (best_rules_string, generation_log_list)
     """
-    # Adapter le split si val_size est donné
+    # on mélange les problèmes avec une graine fixe pour la reproductibilité
     shuffled = list(problems)
     random.seed(42)
     random.shuffle(shuffled)
 
+    # dev_val_split = proportion du total allouée au dev (optimize() l'utilise pour re-couper en interne)
     if val_size is not None:
-        val = shuffled[:val_size]
-        dev = shuffled[val_size:]
-        dev_val_split = len(dev) / max(1, len(problems)) if problems else 0.5
+        dev_val_split = (len(problems) - val_size) / max(1, len(problems))
     else:
-        val = None
-        dev = None
-        dev_val_split = DEFAULT_DEV_VAL_SPLIT
+        dev_val_split = (NUM_PROBLEMS - VAL_SIZE) / max(1, NUM_PROBLEMS)
 
     gepa = GEPA(
         initial_rules=initial_rules,
@@ -776,20 +773,13 @@ def run_gepa_fidele(
         minibatch_size=minibatch_size,
     )
 
-    # Si on a forcé un split manuel, on override
-    if val is not None and dev is not None:
-        gepa.val_examples = val
-        gepa.dev_examples = dev
-        # On ne re-split pas dans optimize, donc on patch
-        # (Note: dans l'implémentation ci-dessus optimize refait le split,
-        #  il faudrait soit passer les sets, soit modifier optimize pour accepter un split externe)
-        # Pour cette version wrapper, on passe train_examples = shuffled et on laisse le split interne
-        # si val_size n'est pas utilisé. Sinon on peut wrapper l'appel.
-        pass
+    # on injecte le baseline pour que le mutateur puisse classer les résultats en 3 catégories
+    if baseline_results:
+        gepa.baseline_by_id = {r["task_id"]: bool(r["success"]) for r in baseline_results}
 
     best_candidate = gepa.optimize(shuffled)
 
-    # Construction d'un gen_log minimal pour compatibilité
+    # on construit un log minimal par génération pour la sauvegarde dans gen_log.json
     gen_log = []
     for gen in range(gepa.max_generations):
         gen_log.append({

@@ -1,19 +1,12 @@
 """
 evaluator.py — Turn a (problem, rules) pair into a pass/fail result.
 
-NEW: Includes answer leakage detection to flag mutations that embed
-code into prompts.
-
 Steps:
   1. Build the full original prompt.
   2. Apply transformation rules via LLM.
-  3. CHECK FOR ANSWER LEAKAGE (new).
+  3. Check for answer leakage (code embedded in the improved prompt).
   4. Ask the LLM for code from the improved prompt.
-  5. Run the tests via eval_benchmark.py-style harness.
-
-Result fields match eval_benchmark.py:
-  Pass@1, Tests_Passed, n_Tests, Eval_Status
-plus GEPA bookkeeping (success/error/prompt/improved/code/task_id).
+  5. Run the tests and return pass/fail.
 """
 
 import re
@@ -27,37 +20,10 @@ from prompts import APPLY_RULES_PROMPT
 from test_runner import run_tests
 
 
-# ── Answer leakage detection ───────────────────────────────────────────────
+TEMPERATURE_APPLY_RULES = 0.0
 
 
-def _check_answer_leakage(original: str, improved: str) -> bool:
-    """Flag if transformation added actual code blocks or function definitions."""
-    import re # Au cas où re n'est pas importé dans ce fichier
-    
-    # On cherche uniquement des structures de code Python réelles sur l'ensemble du texte
-    leak_patterns = [
-        r'def\s+\w+\s*\([^)]*\)\s*(?:->\s*\w+)?\s*:\s*\n\s+',  # Une fonction avec son bloc indenté
-        r'class\s+Solution\s*:',                                  # Une classe de résolution
-        r'```python\n\s*def\s+',                                  # Un bloc Markdown python qui démarre une fonction
-    ]
-    
-    for pattern in leak_patterns:
-        if re.search(pattern, improved):  # Analyse globale sur 'improved' (sans découpage)
-            return True
-            
-    return False
-
-# ── Prompt transformation ──────────────────────────────────────────────────
-
-def apply_transformation_rules(rules: str, original_prompt: str) -> str:
-    """Run the rules over the original prompt and return the improved version."""
-    prompt = APPLY_RULES_PROMPT.format(rules=rules, original_prompt=original_prompt)
-    improved = safe_call(prompt, temperature=0.3)
-    return improved
-
-
-# ── Code generation ────────────────────────────────────────────────────────
-
+# suffix appended to every code generation prompt to force complete, importable solutions
 _CODE_GEN_SUFFIX = (
     "\n\nWrite a complete, fully implemented Python solution. "
     "Do NOT use `pass`, empty function bodies, or placeholder docstrings — every function must contain real logic. "
@@ -67,38 +33,41 @@ _CODE_GEN_SUFFIX = (
 )
 
 
-def generate_code(prompt: str, starter_code: str = "",
-                  temperature: float = GEN_TEMPERATURE) -> str:
-    """Generate code from a prompt, attaching starter code when present."""
-    if starter_code and starter_code.strip():
-        full_prompt = (
-            f"{prompt}\n\n"
-            f"Complete this starter code:\n```python\n{starter_code}\n```"
-            f"{_CODE_GEN_SUFFIX}"
-        )
-    else:
-        full_prompt = prompt + _CODE_GEN_SUFFIX
-
-    return extract_code(
-        safe_call(full_prompt, temperature=temperature,
-                  system_prompt=CODE_GEN_SYSTEM_PROMPT)
-    )
+# splits the "APPLIED_RULES: 1,3,4" first line from the improved prompt body
+# returns ("1,3,4", "improved prompt text") or ("?", raw) if the line is missing
+def _parse_applied_rules(raw: str) -> tuple[str, str]:
+    if not raw:
+        return "?", raw
+    first_line, _, rest = raw.partition('\n')
+    first_line = first_line.strip()
+    # valid if it contains only digits, commas, and spaces (e.g. "1,3,4")
+    if re.match(r'^[\d,\s]+$', first_line) and first_line:
+        return first_line.replace(' ', ''), rest.strip()
+    return "?", raw
 
 
-# ── Per-problem evaluation ─────────────────────────────────────────────────
+# checks if the llm accidentally inserted python code inside the improved prompt
+def _check_answer_leakage(original: str, improved: str) -> bool:
+    leak_patterns = [
+        r'def\s+\w+\s*\([^)]*\)\s*(?:->\s*\w+)?\s*:\s*\n\s+',  # python function with indented body
+        r'class\s+Solution\s*:',                                  # leetcode solution class
+        r'```python\n\s*def\s+',                                  # markdown python block starting with a function
+    ]
+    for pattern in leak_patterns:
+        if re.search(pattern, improved):
+            return True
+    return False
 
+
+# get the original prompt from the problem dict
 def _build_full_prompt(problem: dict) -> str:
-    """The prompt as the model would see it before any transformation."""
     return problem.get("question_content", "") or problem.get("original_prompt", "")
 
 
+# packages all evaluation fields into a single result dict
 def _make_result(p: dict, original: str, improved: str, code: str,
-                 pass_at_1: bool, status: str, tests_passed: int, n_tests: int) -> dict:
-    """Shape one evaluation outcome into a dict.
-    
-    Fields named like eval_benchmark.py (Pass@1, Tests_Passed, n_Tests, Eval_Status),
-    with `success` and `error` for GEPA loop compatibility.
-    """
+                 pass_at_1: bool, status: str, tests_passed: int, n_tests: int,
+                 applied_rules: str = "?") -> dict:
     return {
         "success":            pass_at_1,
         "error":              "" if pass_at_1 else status,
@@ -111,28 +80,59 @@ def _make_result(p: dict, original: str, improved: str, code: str,
         "code":               code,
         "task_id":            p["task_id"],
         "canonical_solution": p.get("canonical_solution", ""),
+        "applied_rules":      applied_rules,
     }
 
 
+# applies the transformation rules to one prompt via llm, returns (applied_rules, improved_text)
+def apply_transformation_rules(rules: str, original_prompt: str) -> tuple[str, str]:
+    prompt = APPLY_RULES_PROMPT.format(rules=rules, original_prompt=original_prompt)
+    raw = safe_call(prompt, temperature=TEMPERATURE_APPLY_RULES)
+    return _parse_applied_rules(raw)
+
+
+# generates python code from a prompt, attaching starter code when the problem provides one
+def generate_code(prompt: str, starter_code: str = "",
+                  temperature: float = GEN_TEMPERATURE) -> str:
+    if starter_code and starter_code.strip():
+        full_prompt = (
+            f"{prompt}\n\n"
+            f"Complete this starter code:\n```python\n{starter_code}\n```"
+            f"{_CODE_GEN_SUFFIX}"
+        )
+    else:
+        full_prompt = prompt + _CODE_GEN_SUFFIX
+    return extract_code(
+        safe_call(full_prompt, temperature=temperature,
+                  system_prompt=CODE_GEN_SYSTEM_PROMPT)
+    )
+
+
+# evaluates one problem with given rules: transform → check leakage → generate code → run tests (cached)
 def evaluate_one(p: dict, rules: str) -> dict:
-    """Evaluate one problem under one rule set. Cached. Returns a result dict.
-    
-    NEW: Includes answer leakage check after transformation.
-    """
+    # return cached result if already computed for this (problem, rules) pair
     cached = cache_get(p["task_id"], rules)
     if cached is not None and isinstance(cached, dict) and "success" in cached:
-        # Backfill canonical_solution for older cached entries
         if "canonical_solution" not in cached:
             cached["canonical_solution"] = p.get("canonical_solution", "")
         return cached
 
     original = _build_full_prompt(p)
-    improved_prompt = apply_transformation_rules(rules, original)
+    applied_rules, improved_prompt = apply_transformation_rules(rules, original)
 
-    # ← NEW: Check for answer leakage (code embedded in prompt)
+    # if the llm returned nothing, fail immediately without evaluating
+    if not improved_prompt:
+        result = _make_result(p, original, "", "", False,
+                              "Empty improved prompt returned by transformation LLM", 0, 0,
+                              applied_rules=applied_rules)
+        cache_set(p["task_id"], rules, result)
+        return result
+
+    # if the llm put actual code in the prompt, discard the result immediately
     if _check_answer_leakage(original, improved_prompt):
         result = _make_result(p, original, improved_prompt, "", False,
-                             "Answer leakage detected in transformation", 0, 0)
+                              "Answer leakage detected in transformation", 0, 0,
+                              applied_rules=applied_rules)
         cache_set(p["task_id"], rules, result)
         return result
 
@@ -141,13 +141,14 @@ def evaluate_one(p: dict, rules: str) -> dict:
     pass_at_1, status, tests_passed, n_tests = run_tests(code, p)
 
     result = _make_result(p, original, improved_prompt, code,
-                          pass_at_1, status, tests_passed, n_tests)
+                          pass_at_1, status, tests_passed, n_tests,
+                          applied_rules=applied_rules)
     cache_set(p["task_id"], rules, result)
     return result
 
 
+# evaluates one problem with no transformation (original prompt only), cached under BASELINE_KEY
 def evaluate_baseline(p: dict) -> dict:
-    """Evaluate one problem with the original prompt — no transformation. Cached."""
     cached = cache_get(p["task_id"], BASELINE_KEY)
     if cached is not None and isinstance(cached, dict) and "success" in cached:
         if "canonical_solution" not in cached:
@@ -165,11 +166,12 @@ def evaluate_baseline(p: dict) -> dict:
     return result
 
 
+# evaluates a full batch with given rules using 2 batched gpu passes + parallel test execution
 def evaluate_batch(problems: list[dict], rules: str) -> list[dict]:
-    """Evaluate a batch: 2 batched GPU calls + parallel test execution."""
     results = [None] * len(problems)
     uncached_idx = []
 
+    # collect which problems are not yet cached
     for i, p in enumerate(problems):
         cached = cache_get(p["task_id"], rules)
         if cached is not None and isinstance(cached, dict) and "success" in cached:
@@ -185,22 +187,24 @@ def evaluate_batch(problems: list[dict], rules: str) -> list[dict]:
     probs = [problems[i] for i in uncached_idx]
     originals = [_build_full_prompt(p) for p in probs]
 
-    # Phase 1: batch transform (1 GPU pass)
+    # gpu pass 1: apply transformation rules to all uncached prompts at once
     t_prompts = [APPLY_RULES_PROMPT.format(rules=rules, original_prompt=o) for o in originals]
-    improved_raw = batch_call_llm(t_prompts, temperature=0.3)
+    improved_raw = batch_call_llm(t_prompts, temperature=TEMPERATURE_APPLY_RULES)
+
+    # parse the APPLIED_RULES: line from each llm output
+    # if the improved prompt is empty, store "" — it will be caught as a fail in _run
+    applied_rules_list = []
     improved = []
-    for orig, imp in zip(originals, improved_raw):
-        # On nettoie juste les espaces blancs invisibles au début/fin
-        imp_clean = imp.strip() if imp else ""
-        # On garde le prompt tel quel s'il fait au moins 20 caractères, sinon fallback
-        improved.append(imp_clean if len(imp_clean) >= 20 else orig)
+    for raw in improved_raw:
+        ar, imp = _parse_applied_rules(raw if raw else "")
+        applied_rules_list.append(ar)
+        improved.append(imp.strip() if imp else "")
 
-
-    # Phase 2: batch code gen (1 GPU pass, skip leaked)
+    # gpu pass 2: generate code from improved prompts (skip empty or leaked)
     leaked = [_check_answer_leakage(o, i) for o, i in zip(originals, improved)]
     c_prompt_idx, c_prompts = [], []
     for j, (p, imp, lk) in enumerate(zip(probs, improved, leaked)):
-        if not lk:
+        if imp and not lk:
             starter = p.get("starter_code", "") or ""
             fp = (f"{imp}\n\nComplete this starter code:\n```python\n{starter}\n```{_CODE_GEN_SUFFIX}"
                   if starter.strip() else imp + _CODE_GEN_SUFFIX)
@@ -214,16 +218,24 @@ def evaluate_batch(problems: list[dict], rules: str) -> list[dict]:
     for k, j in enumerate(c_prompt_idx):
         codes[j] = extract_code(raw_codes[k])
 
-    # Phase 3: parallel test execution (CPU)
+    # cpu phase: run tests for all problems in parallel
     def _run(j):
         p = probs[j]
         orig, imp, code, lk = originals[j], improved[j], codes[j], leaked[j]
-        if lk:
+        ar = applied_rules_list[j]
+        if not imp:
+            # llm returned an empty improved prompt — skip evaluation, count as fail
             r = _make_result(p, orig, imp, "", False,
-                             "Answer leakage detected in transformation", 0, 0)
+                             "Empty improved prompt returned by transformation LLM", 0, 0,
+                             applied_rules=ar)
+        elif lk:
+            r = _make_result(p, orig, imp, "", False,
+                             "Answer leakage detected in transformation", 0, 0,
+                             applied_rules=ar)
         else:
             pass_at_1, status, tp, nt = run_tests(code, p)
-            r = _make_result(p, orig, imp, code, pass_at_1, status, tp, nt)
+            r = _make_result(p, orig, imp, code, pass_at_1, status, tp, nt,
+                             applied_rules=ar)
         cache_set(p["task_id"], rules, r)
         return j, r
 
@@ -234,11 +246,12 @@ def evaluate_batch(problems: list[dict], rules: str) -> list[dict]:
     return results
 
 
+# evaluates a full batch with no transformation (baseline) using 1 batched gpu pass + parallel tests
 def evaluate_baseline_batch(problems: list[dict]) -> list[dict]:
-    """Baseline evaluation: 1 batched GPU call + parallel test execution."""
     results = [None] * len(problems)
     uncached_idx = []
 
+    # collect which problems are not yet cached
     for i, p in enumerate(problems):
         cached = cache_get(p["task_id"], BASELINE_KEY)
         if cached is not None and isinstance(cached, dict) and "success" in cached:
@@ -255,6 +268,7 @@ def evaluate_baseline_batch(problems: list[dict]) -> list[dict]:
     probs = [problems[i] for i in uncached_idx]
     originals = [_build_full_prompt(p) for p in probs]
 
+    # gpu pass: generate code from original prompts (no transformation)
     c_prompts = []
     for p, orig in zip(probs, originals):
         starter = p.get("starter_code", "") or ""
@@ -266,6 +280,7 @@ def evaluate_baseline_batch(problems: list[dict]) -> list[dict]:
                                system_prompt=CODE_GEN_SYSTEM_PROMPT)
     codes = [extract_code(r) for r in raw_codes]
 
+    # cpu phase: run tests in parallel
     def _run(j):
         p = probs[j]
         orig, code = originals[j], codes[j]
@@ -281,8 +296,8 @@ def evaluate_baseline_batch(problems: list[dict]) -> list[dict]:
     return results
 
 
+# convenience wrapper: evaluates rules over problems and returns (pass_count, results)
 def score_transformation_rules(rules: str, problems: list) -> tuple[int, list[dict]]:
-    """Run a rule set over a list of problems. Returns (pass_count, results)."""
     results = evaluate_batch(problems, rules)
     success_count = sum(1 for r in results if r["success"])
     return success_count, results
